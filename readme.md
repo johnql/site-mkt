@@ -33,3 +33,164 @@ The Api container expects the following environment variables:
 - `DB_CONNECTION_STRING` to contain a connection string for a SQL Server.
 
 The solution also contains a `docker-compose.yml` file that can be used to run the site locally using Docker.
+
+---
+
+## Deployment Guide
+
+## Architecture
+
+```text
+Internet
+   │
+   ▼
+Azure Container Apps (external ingress)
+   ca-site-mkt-prod  (:8080)
+   │                │
+   ▼                ▼
+Redis Cache      ca-api-mkt-prod  (internal only, :8080)
+(private         │
+ endpoint)       ▼
+              Azure SQL Server
+              (private endpoint)
+```
+
+All traffic between containers is internal to the Container App Environment VNet. SQL and Redis are accessible only via private endpoints — no public internet exposure.
+
+**Resources provisioned:**
+
+| Resource | Name Pattern | Notes |
+|---|---|---|
+| Resource Group | `rg-{app}-{env}-{location}` | All resources except SQL server |
+| VNet | `vnet-{app}-{env}` | `10.0.0.0/16` |
+| ACA Subnet | `snet-aca` | `10.0.0.0/21`, delegated to `Microsoft.App/environments` |
+| Private Endpoint Subnet | `snet-pe` | `10.0.8.0/24` |
+| Container Registry | pre-created (bootstrap) | Shared ACR for all environments |
+| Container App Environment | `cae-{app}-{env}` | VNet-integrated |
+| Container App — Site | `ca-site-{app}-{env}` | External ingress, 1–10 replicas |
+| Container App — Api | `ca-api-{app}-{env}` | Internal ingress only, 1–10 replicas |
+| Azure SQL Server | `sql-{app}-{env}-{suffix}` | Deployed in configurable region |
+| Azure SQL Database | `marketingdb` | General Purpose serverless |
+| Azure Cache for Redis | `redis-{app}-{env}-{suffix}` | Standard C1, private endpoint |
+| Key Vault | `kv-{app}-{env}-{suffix}` | Stores DB + Redis connection strings |
+| User-Assigned Identity | `id-aca-{app}-{env}` | AcrPull + Key Vault Get/List |
+| Private DNS Zones | `privatelink.database.windows.net`, `privatelink.redis.cache.windows.net` | VNet-linked |
+
+## Design Decisions
+
+**Azure Container Apps** — Chosen over AKS for this workload because the traffic pattern (10 AM–8 PM burst) maps perfectly to HTTP-based autoscaling without the overhead of managing Kubernetes. Scale rules fire at 20 concurrent requests, scaling from 1 to 10 replicas. Min replicas = 1 keeps cold-start latency out of the picture during business hours.
+
+**Private endpoints for SQL and Redis** — Both data stores are completely isolated from the public internet. The ACA environment runs inside a VNet; private DNS zones resolve `*.privatelink` hostnames so containers connect over the private network without any credentials in image layers or environment variables.
+
+**Key Vault + Managed Identity** — Connection strings are stored as Key Vault secrets and mounted directly into Container Apps via the `secret` block. The user-assigned identity (`id-aca-mkt-prod`) holds both the `AcrPull` role on ACR and a Key Vault access policy. No static credentials or SAS tokens anywhere.
+
+**Random suffix on SQL/Redis names** — Azure SQL server names and Redis cache names are globally unique across all Azure tenants. The `random_string` resource ensures conflict-free names on every new deployment of the template.
+
+**`sql_location` as a separate variable** — Azure SQL provisioning availability varies by subscription type and region. Decoupling `sql_location` from `location` lets teams pick the nearest unrestricted region without moving the rest of the stack.
+
+**Terraform remote state in Azure Blob Storage** — State is stored in a dedicated storage account (`stmktterraformstate`) with versioning enabled. Teams adapting this template should create their own backend storage account during bootstrap.
+
+**Reusability** — The entire stack is parameterised via `variables.tf`. To deploy a second environment, change `app_name`, `environment`, and optionally `location`. All resource names derive from `local.prefix = "${var.app_name}-${var.environment}"`.
+
+## Prerequisites
+
+- Azure CLI (`az`) authenticated to the target subscription
+- Terraform >= 1.5
+- Docker (for building and pushing images)
+- Bash (WSL or Git Bash on Windows)
+
+## One-Time Bootstrap
+
+Run once per subscription to create the ACR and Terraform state backend:
+
+```bash
+cd infra/scripts
+chmod +x bootstrap.sh
+./bootstrap.sh
+```
+
+The script:
+1. Registers required Azure resource providers
+2. Creates the Terraform remote state storage account and container
+3. Creates Azure Container Registry `acrmktprodeastus`
+4. Builds both Docker images and pushes them to ACR
+
+## Deploy Infrastructure
+
+```bash
+cd infra
+
+# Copy and populate variables
+cp terraform.tfvars.example terraform.tfvars   # if using the example file
+# Edit terraform.tfvars with your subscription_id and sql_admin_password
+
+terraform init
+terraform plan -var-file="terraform.tfvars"
+terraform apply -var-file="terraform.tfvars"
+```
+
+**Key variables in `terraform.tfvars`:**
+
+```hcl
+subscription_id    = "<your-subscription-id>"
+location           = "eastus"          # Region for most resources
+sql_location       = "centralus"       # Region for SQL Server (may differ)
+environment        = "prod"
+app_name           = "mkt"
+acr_name           = "acrmktprodeastus"
+sql_admin_username = "sqladmin"
+sql_admin_password = "<strong-password>"
+redis_sku          = "Standard"
+redis_family       = "C"
+redis_capacity     = 1
+```
+
+> **Note on `sql_location`:** Azure SQL provisioning is restricted in some regions for certain subscription types. If you hit a `ProvisioningDisabled` error, try `centralus`, `canadacentral`, or `northeurope`.
+
+## Verify the Deployment
+
+```bash
+# Get the live URL
+terraform output site_url
+
+# Health check
+curl https://<site_url>/health
+
+# Full page load (should render HTML with current date/time)
+curl https://<site_url>
+```
+
+Expected: HTTP 200 with an HTML page showing "Hello World" and the current datetime from SQL.
+
+## Adapting for Another Team
+
+1. Fork this repository
+2. Run bootstrap with a different `acr_name` (or reuse an existing ACR)
+3. In `terraform.tfvars`, set `app_name` to your team's identifier (e.g. `payments`)
+4. All resources will be namespaced under `payments-prod-*` with no conflicts
+
+## Local Development
+
+```bash
+docker-compose up        # Runs site, api, redis, and SQL Server locally
+# Site accessible at http://localhost:8881
+```
+
+## CI/CD
+
+`.github/workflows/build.yml` builds both Docker images on push to `main`. Extend it to push to ACR after a successful build:
+
+```yaml
+- name: Push to ACR
+  run: |
+    az acr login --name $ACR_NAME
+    docker push $ACR_NAME.azurecr.io/marketing-site:latest
+    docker push $ACR_NAME.azurecr.io/marketing-api:latest
+```
+
+After pushing new images, trigger a Container App revision by running `terraform apply` or using the Azure CLI:
+
+```bash
+az containerapp update --name ca-site-mkt-prod --resource-group rg-mkt-prod-eastus \
+  --image acrmktprodeastus.azurecr.io/marketing-site:latest
+```

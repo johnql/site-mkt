@@ -1,0 +1,10 @@
+variable "prefix" { type = string }
+variable "location" { type = string }
+variable "resource_group_name" { type = string }
+variable "tags" { type = map(string) }
+variable "acr_login_server" { type = string }
+variable "acr_id" { type = string }
+variable "aca_subnet_id" { type = string }
+variable "keyvault_id" { type = string }
+variable "db_secret_uri" { type = string }
+variable "redis_secret_uri" { type = string }
