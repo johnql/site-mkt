@@ -150,6 +150,8 @@ redis_capacity     = 1
 ## Verify the Deployment
 
 ```bash
+cd infra
+
 # Get the live URL
 terraform output site_url
 
