@@ -194,3 +194,32 @@ After pushing new images, trigger a Container App revision by running `terraform
 az containerapp update --name ca-site-mkt-prod --resource-group rg-mkt-prod-eastus \
   --image acrmktprodeastus.azurecr.io/marketing-site:latest
 ```
+
+### Weakest Points in the Current Solution
+
+**Security — SQL password is a static credential.** The connection string stored in Key Vault contains a username/password. The correct pattern for Azure SQL is Azure Active Directory authentication with the ACA managed identity, which eliminates the password entirely. This is a meaningful gap for a "security-critical" data store.
+
+**Cost — Redis Standard C1 is always-on.** Redis does not scale to zero. At ~$55/month for Standard C1, it is the dominant cost in this stack at low traffic. For a promotional site with a 10-hour daily traffic window, consider a scheduled script that scales Redis down at 8 PM EST and up at 10 AM, or evaluate whether the 5-second TTL cache is worth a dedicated Redis tier at all (an in-memory cache in the Site container would suffice at low scale).
+
+**Reliability — Single availability zone.** No AZ pinning is configured anywhere. Azure Container Apps do distribute replicas across zones in supported regions, but SQL and Redis are on default zone-redundant settings only on higher service tiers. For production, SQL should be on at least `GeneralPurpose` with zone-redundant backup, and Redis Standard already includes replication.
+
+**Observability — none.** The site is live with no alerts, no dashboards, and no structured logging correlation between Site → Api → SQL. A production incident would require raw log queries from the start.
+
+# optimization opportunities
+
+**Already optimized:**
+
+    Redis 5s TTL shields SQL from ~99% of peak traffic
+    ACA scales to zero outside 10AM–8PM, eliminating idle cost
+    Private Endpoints keep SQL/Redis off the public internet
+
+**Top optimization to add:**
+
+    ACA scheduled scaling — keep min 1 replica during 10AM–8PM to avoid cold starts during the campaign burst. Highest impact, near-zero cost.
+
+**Main offsets (tradeoffs):**
+
+    VNet + Private Endpoints = ~$15+/month but required given sensitive SQL data
+    Redis Standard (HA) vs Basic C0 — double the cost, but Basic is risky for production
+    Azure SQL Serverless saves cost but has cold-start risk (mitigated by Redis cache)
+    Front Door adds performance at edge but adds $35+/month — skip for POC
